@@ -1,0 +1,119 @@
+#!/bin/bash
+
+set -e
+
+# Allow config from outer environment if set, otherwise initalize to 0
+GSSH_DEBUG="${GSSH_DEBUG:-0}"
+GSSH_SILENT="${GSSH_SILENT:-0}"
+GSSH_ENVWORKAROUND="${GSSH_ENVWORKAROUND:-0}"
+for ARG in "$@"; do
+    shift
+    case $ARG in
+        --gssh-debug)
+            GSSH_DEBUG=1 ;;
+	--gssh-silent)
+	    GSSH_SILENT=1 ;;
+        --env-workaround)
+            GSSH_ENVWORKAROUND=1;;
+        *)
+            set -- "$@" "$ARG" ;;
+    esac
+done
+
+# Right hand side is equivalent to gpgconf --list-dirs agent-socket in newer versions of gpg
+# export SSH_AUTH_SOCK="$(gpgconf --list-dirs | awk -F: '$1=="agent-socket" {print $2}')"
+
+if [ -z "$SSH_CONNECTION" ]; then
+    LOCAL_SOCK="$(gpgconf --list-dirs | awk -F: '$1=="agent-extra-socket" {print $2}')"
+    if [ -z "$GPG_PUBKEY" ]; then
+        if gpg --card-status 2>&1 > /dev/null; then
+            # Yubikey, smartcards, etc.
+            GPG_KEYID=$(gpg --card-status --with-colons | grep "^fpr:" | awk -F: '{print $2}')
+        else
+            # Standard GPG default key
+            GPG_KEYID="$(gpgconf --list-options gpg | awk -F: '$1 == "default-key" {print $10}')"
+        fi
+        if [ -z "$GPG_KEYID" ]; then
+            echo "Could not determine you gpg signing key id."
+            echo "Connect yubikey/smartcard; or set GPG_PUBKEY."
+            echo
+            exit 1
+        fi
+        GPG_PUBKEY=$(gpg --armor --export "$GPG_KEYID")
+    fi
+else
+    # This Allows chaining gpg forwarding
+    LOCAL_SOCK="$(gpgconf --list-dirs | awk -F: '$1=="agent-socket" {print $2}')"
+fi
+
+if [ "$GSSH_DEBUG" = "1" ]; then
+    echo "GPG_KEYID: $GPG_KEYID"
+    echo
+    echo "$GPG_PUBKEY" | gpg --show-keys
+fi
+
+# Smuggle the PUBKEY, KEYID and a randomized tmp directory name for the socket via
+# pretend LC_* variables since ssh transfer them over by default
+export LC_GSSH_PUBKEY="$GPG_PUBKEY"
+export LC_GSSH_KEYID="$GPG_KEYID"
+export LC_GSSH_SOCKET="$(mktemp -u)"
+# While we are at it, why not simplify the setup on the remote machine by providing a script
+# that can be run via eval to set up the config on the remote side?
+export LC_GSSH_CONFIG="cat > ~/.gssh-gpg-wrap <<EOF
+#!/bin/bash
+if [ -z \"\\\$LC_GSSH_SOCKET\" -o -z \"\\\$LC_GSSH_PUBKEY\" -o -z \"\\\$LC_GSSH_KEYID\" ]; then
+    exec gpg \"\\\$@\"
+    exit 0
+fi
+
+GPGVER=\\\$(gpg --version | head -n 1 | sed \"s/gpg (GnuPG) //\")
+if [ \"\\\${GPGVER%.*}\" == \"2.0\" ]; then
+   # Not yet supported
+   exit 1
+   KEYGRIP=\"?\"
+   #gpg --list-keys -k \"$LC_GSSH_KEYID\"
+   DATA=\\\$(cat)
+   SHA512=\\\$(echo "$DATA" | sha512sum | awk '{print $1}')
+   gpg-connect-agent --quiet --raw-socket $LC_GSSH_SOCKET \"SIGKEY \${KEYGRIP}\" \"SETHASH 10 \$SHA512\" \"/echo ====START====\" \"PKSIGN\" \"/echo ====END====\" \"/bye\" | awk \"/^====END====\\\$/{out=0} out==1 {print} /^====START====\\\$/ {out=1}\" > test-sign.dat
+    exit 0
+fi
+
+export GNUPGHOME=\\\$(mktemp -d \".gnupg-tmp-XXXXXXXXXX\" -p ~/)
+export GNUPGHOME_SUFFIX=\\\${GNUPGHOME#~/.gnupg-tmp-}
+trap \"rm -rf -- ~/\\\".gnupg-tmp-\\\${GNUPGHOME_SUFFIX}\\\"\" EXIT
+gpgconf --change-options gpg <<< \"default-key:0:\\\"\\\$LC_GSSH_KEYID\"
+gpg --import <<<\"\\\$LC_GSSH_PUBKEY\"
+AGENT_SOCKET=\"\\\$(gpgconf --list-dirs | awk -F: \"\\\\\\\$1==\\\"agent-socket\\\" {print \\\\\\\$2}\")\"
+if [ -n \"\\\$AGENT_SOCKET\" ]; then
+   ln -sf \"\\\$LC_GSSH_SOCKET\" \"\\\$AGENT_SOCKET\"
+fi
+gpg \"\\\$@\"
+EOF
+chmod +x ~/.gssh-gpg-wrap
+git config --global gpg.program ~/.gssh-gpg-wrap
+git config --global commit.gpgsign true
+"
+if [ "$GSSH_SILENT" != "1" ]; then
+    echo "## Notice: to set up git signatures on the remote side, execute: eval \"\$LC_GSSH_CONFIG\""  >&2
+    echo "## If you want the gpg command itself to forward, add alias gpg=~/.gssh-gpg-wrap to your init scripts."  >&2
+fi
+
+if [ "$GSSH_ENVWORKAROUND" != "1" ]; then
+    exec ssh -S -A -R "$LC_GSSH_SOCKET":"$LOCAL_SOCK" "$@"
+else
+    [ "$GSSH_SILENT" != "1" ] && echo "## Notice: applying workaround for transfering environment variables to remote side; this may supress the motd welcome message."
+    exec ssh -t -S -A -R "$LC_GSSH_SOCKET":"$LOCAL_SOCK" "$@" "export LC_GSSH_SOCKET='$LC_GSSH_SOCKET'; export LC_GSSH_PUBKEY='$LC_GSSH_PUBKEY'; export LC_GSSH_KEYID='$LC_GSSH_KEYID'; export LC_GSSH_CONFIG='$LC_GSSH_CONFIG'; bash -l"
+fi
+
+# Older two-step process kept for reference
+#
+#echo "First connection to obtain remote GPG socket info" >&2
+# Trasfer public key and makes sure it is imported in remote gpg
+#REMOTE_SOCK=$(echo "$GPG_PUBKEY" | ssh "$@" "SOCK=\$(gpgconf --list-dir agent-socket); test -S \$SOCK && rm -f \$SOCK; gpg --import >&2; gpgconf --change-options gpg <<< 'default-key:0:\"$GPG_KEYID' >&2; echo \$SOCK")
+#SSH_EXIT_CODE="$?"
+#if [ "$SSH_EXIT_CODE" != "0" ]; then
+#    exit $SSH_EXIT_CODE
+#fi
+#
+#echo "Second connection to open SSH" >&2
+#exec ssh -S -A -R "$REMOTE_SOCK":"$LOCAL_SOCK" "$@"
