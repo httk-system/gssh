@@ -1,0 +1,100 @@
+#!/bin/bash
+#
+# This is a version of gssh for clients still only on gpg 2.0
+# 
+
+
+set -e
+
+# Allow config from outer environment if set, otherwise initalize to 0
+GSSH_DEBUG="${GSSH_DEBUG:-0}"
+GSSH_SILENT="${GSSH_SILENT:-0}"
+GSSH_ENVWORKAROUND="${GSSH_ENVWORKAROUND:-0}"
+for ARG in "$@"; do
+    shift
+    case $ARG in
+        --gssh-debug)
+            GSSH_DEBUG=1 ;;
+	--gssh-silent)
+	    GSSH_SILENT=1 ;;
+        --envfix)
+            GSSH_ENVWORKAROUND=1;;
+        *)
+            set -- "$@" "$ARG" ;;
+    esac
+done
+
+LOCAL_SOCK="$(mktemp -u)"
+# This is a local proxy-server that just delivers gpg signatures on data it receives
+python3 -c '
+import socket, sys, hashlib, os, subprocess
+
+socket_path=sys.argv[1]
+if os.path.exists(socket_path):
+    os.unlink(socket_path)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(socket_path)
+s.setblocking(True)
+while True:
+  s.listen(1)
+  conn, addr = s.accept()
+  response=b""
+  c = b""
+  while c != b"\n":
+    c=conn.recv(1)
+    response+=c
+  size=int(response)
+  recvsize=0
+  response=b""
+  while recvsize<size:
+      response+=conn.recv(4096)
+      recvsize+=len(response)
+
+  p=subprocess.Popen(["gpg","-bsa"], shell=False, stdout=subprocess.PIPE, stdin=subprocess.PIPE)
+  out, err = p.communicate(response)
+  
+  conn.sendall(out)
+  conn.close()
+' "$LOCAL_SOCK" &
+SERVER=$!
+trap 'kill $SERVER' EXIT
+
+# Smuggle a randomized tmp directory name for the socket via a pretend LC_* variable
+# since ssh transfer them over by default
+export LC_GSSH_SOCKET="$(mktemp -u)"
+# While we are at it, why not simplify the setup on the remote machine by providing a script
+# that can be run via eval to set up the config on the remote side?
+
+export LC_GSSH_CONFIG="cat > ~/.gssh-gpg-wrap <<EOF
+#!/usr/bin/env python3
+
+import socket, sys, hashlib, os
+
+socket_path=os.environ.get(\"LC_GSSH_SOCKET\")
+data=sys.stdin.buffer.read()
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(socket_path)
+s.setblocking(True)
+s.sendall(bytes(str(len(data)),encoding=\"utf8\")+b\"\n\")
+s.sendall(data)
+response = True
+while response != b\"\":
+      response=s.recv(4096)
+      sys.stdout.buffer.write(response)
+s.close()
+EOF
+chmod +x ~/.gssh-gpg-wrap
+git config --global gpg.program ~/.gssh-gpg-wrap
+git config --global commit.gpgsign true
+"
+if [ "$GSSH_SILENT" != "1" ]; then
+    echo "## Notice: to set up git signatures on the remote side, execute: eval \"\$LC_GSSH_CONFIG\""  >&2
+    echo "## If you want the gpg command itself to forward, add alias gpg=~/.gssh-gpg-wrap to your init scripts."  >&2
+fi
+
+if [ "$GSSH_ENVWORKAROUND" != "1" ]; then
+    exec ssh -S -A -R "$LC_GSSH_SOCKET":"$LOCAL_SOCK" "$@"
+else
+    [ "$GSSH_SILENT" != "1" ] && echo "## Notice: applying workaround for transfering environment variables to remote side; this may supress the motd welcome message."
+    exec ssh -t -S -A -R "$LC_GSSH_SOCKET":"$LOCAL_SOCK" "$@" "export LC_GSSH_SOCKET='$LC_GSSH_SOCKET'; export LC_GSSH_PUBKEY='$LC_GSSH_PUBKEY'; export LC_GSSH_KEYID='$LC_GSSH_KEYID'; export LC_GSSH_CONFIG='$LC_GSSH_CONFIG'; bash -l"
+fi

@@ -13,7 +13,7 @@ for ARG in "$@"; do
             GSSH_DEBUG=1 ;;
 	--gssh-silent)
 	    GSSH_SILENT=1 ;;
-        --env-workaround)
+        --envfix)
             GSSH_ENVWORKAROUND=1;;
         *)
             set -- "$@" "$ARG" ;;
@@ -68,14 +68,8 @@ fi
 
 GPGVER=\\\$(gpg --version | head -n 1 | sed \"s/gpg (GnuPG) //\")
 if [ \"\\\${GPGVER%.*}\" == \"2.0\" ]; then
-   # Not yet supported
+   echo \"GPG forwarding does not work on gpg 2.0.x; 2.1.x or newer required\" >&2
    exit 1
-   KEYGRIP=\"?\"
-   #gpg --list-keys -k \"$LC_GSSH_KEYID\"
-   DATA=\\\$(cat)
-   SHA512=\\\$(echo "$DATA" | sha512sum | awk '{print $1}')
-   gpg-connect-agent --quiet --raw-socket $LC_GSSH_SOCKET \"SIGKEY \${KEYGRIP}\" \"SETHASH 10 \$SHA512\" \"/echo ====START====\" \"PKSIGN\" \"/echo ====END====\" \"/bye\" | awk \"/^====END====\\\$/{out=0} out==1 {print} /^====START====\\\$/ {out=1}\" > test-sign.dat
-    exit 0
 fi
 
 export GNUPGHOME=\\\$(mktemp -d \".gnupg-tmp-XXXXXXXXXX\" -p ~/)
@@ -104,16 +98,3 @@ else
     [ "$GSSH_SILENT" != "1" ] && echo "## Notice: applying workaround for transfering environment variables to remote side; this may supress the motd welcome message."
     exec ssh -t -S -A -R "$LC_GSSH_SOCKET":"$LOCAL_SOCK" "$@" "export LC_GSSH_SOCKET='$LC_GSSH_SOCKET'; export LC_GSSH_PUBKEY='$LC_GSSH_PUBKEY'; export LC_GSSH_KEYID='$LC_GSSH_KEYID'; export LC_GSSH_CONFIG='$LC_GSSH_CONFIG'; bash -l"
 fi
-
-# Older two-step process kept for reference
-#
-#echo "First connection to obtain remote GPG socket info" >&2
-# Trasfer public key and makes sure it is imported in remote gpg
-#REMOTE_SOCK=$(echo "$GPG_PUBKEY" | ssh "$@" "SOCK=\$(gpgconf --list-dir agent-socket); test -S \$SOCK && rm -f \$SOCK; gpg --import >&2; gpgconf --change-options gpg <<< 'default-key:0:\"$GPG_KEYID' >&2; echo \$SOCK")
-#SSH_EXIT_CODE="$?"
-#if [ "$SSH_EXIT_CODE" != "0" ]; then
-#    exit $SSH_EXIT_CODE
-#fi
-#
-#echo "Second connection to open SSH" >&2
-#exec ssh -S -A -R "$REMOTE_SOCK":"$LOCAL_SOCK" "$@"
