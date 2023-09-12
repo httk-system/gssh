@@ -93,8 +93,8 @@ if [ "$GSSH_SILENT" != "1" ]; then
 fi
 
 if [ "$GSSH_ENVWORKAROUND" != "1" ]; then
-    exec ssh -S -A -R "$LC_GSSH_SOCKET":"$LOCAL_SOCK" "$@"
+    exec ssh -A -R "$LC_GSSH_SOCKET":"$LOCAL_SOCK" "$@"
 else
     [ "$GSSH_SILENT" != "1" ] && echo "## Notice: applying workaround for transfering environment variables to remote side; this may supress the motd welcome message."
-    exec ssh -t -S -A -R "$LC_GSSH_SOCKET":"$LOCAL_SOCK" "$@" "export LC_GSSH_SOCKET='$LC_GSSH_SOCKET'; export LC_GSSH_PUBKEY='$LC_GSSH_PUBKEY'; export LC_GSSH_KEYID='$LC_GSSH_KEYID'; export LC_GSSH_CONFIG='$LC_GSSH_CONFIG'; bash -l"
+    exec ssh -t -A -R "$LC_GSSH_SOCKET":"$LOCAL_SOCK" "$@" "export LC_GSSH_SOCKET='$LC_GSSH_SOCKET'; export LC_GSSH_PUBKEY='$LC_GSSH_PUBKEY'; export LC_GSSH_KEYID='$LC_GSSH_KEYID'; export LC_GSSH_CONFIG='$LC_GSSH_CONFIG'; bash -l"
 fi
